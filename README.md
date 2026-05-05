@@ -51,7 +51,7 @@ cat <<EOF> .envrc
 export RESOURCE_GROUP="rg-aca-blob-private"
 export LOCATION="westus3"
 export ACA_ENV_NAME="aca-env-blob"
-export ACA_APP_NAME="blob-reader"
+export ACA_APP_NAME="ca-blob-test"
 export STORAGE_ACCOUNT="stacablob${RANDOM}"
 export STORAGE_CONTAINER="data"
 export IDENTITY_NAME="id-aca-blob"
@@ -84,12 +84,13 @@ az network vnet create \
   --location ${LOCATION} \
   --address-prefix 10.0.0.0/16
 
-# ACA infrastructure subnet (minimum /23)
+# ACA infrastructure subnet (minimum /23, must be delegated)
 az network vnet subnet create \
   --name ${SUBNET_ACA} \
   --resource-group ${RESOURCE_GROUP} \
   --vnet-name ${VNET_NAME} \
-  --address-prefix 10.0.0.0/23
+  --address-prefix 10.0.0.0/23 \
+  --delegations Microsoft.App/environments
 
 # Private endpoint subnet
 az network vnet subnet create \
@@ -98,6 +99,8 @@ az network vnet subnet create \
   --vnet-name ${VNET_NAME} \
   --address-prefix 10.0.2.0/24
 ```
+
+> **Important:** The ACA infrastructure subnet must be delegated to `Microsoft.App/environments`. Without this delegation, environment creation will fail with `ManagedEnvironmentSubnetDelegationError`.
 
 ## Create the Storage Account
 
@@ -265,31 +268,72 @@ az containerapp env create \
 
 ## Deploy the Container App
 
-Deploy a container app that uses the managed identity to access blob storage:
+Deploy a container app that uses the managed identity to access blob storage. We use a YAML template to correctly pass multi-argument commands:
 
 ```bash
+cat <<EOF > container-app.yaml
+properties:
+  template:
+    containers:
+      - name: ${ACA_APP_NAME}
+        image: mcr.microsoft.com/azure-cli:latest
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+        env:
+          - name: AZURE_CLIENT_ID
+            value: "${IDENTITY_CLIENT_ID}"
+          - name: STORAGE_ACCOUNT_NAME
+            value: "${STORAGE_ACCOUNT}"
+          - name: STORAGE_CONTAINER_NAME
+            value: "${STORAGE_CONTAINER}"
+        command:
+          - /bin/bash
+          - -c
+          - |
+            echo "Container started"
+            sleep infinity
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
+EOF
+
 az containerapp create \
   --name ${ACA_APP_NAME} \
   --resource-group ${RESOURCE_GROUP} \
   --environment ${ACA_ENV_NAME} \
-  --image mcr.microsoft.com/azure-cli:latest \
-  --cpu 0.25 \
-  --memory 0.5Gi \
-  --min-replicas 1 \
-  --max-replicas 1 \
-  --user-assigned ${IDENTITY_RESOURCE_ID} \
-  --env-vars \
-    AZURE_CLIENT_ID="${IDENTITY_CLIENT_ID}" \
-    STORAGE_ACCOUNT_NAME="${STORAGE_ACCOUNT}" \
-    STORAGE_CONTAINER_NAME="${STORAGE_CONTAINER}" \
-  --command "/bin/bash" "-c" "sleep infinity"
+  --yaml container-app.yaml
+```
+
+Assign the managed identity to the container app:
+
+```bash
+az containerapp identity assign \
+  --resource-group ${RESOURCE_GROUP} \
+  --name ${ACA_APP_NAME} \
+  --user-assigned ${IDENTITY_RESOURCE_ID}
+```
+
+Enable internal ingress (required for `az containerapp exec` and for service-to-service communication within the VNet):
+
+```bash
+az containerapp ingress enable \
+  --resource-group ${RESOURCE_GROUP} \
+  --name ${ACA_APP_NAME} \
+  --type internal \
+  --target-port 8080 \
+  --transport auto
 ```
 
 > **Tip:** Replace the image and command with your actual application. The example above uses the Azure CLI image for testing. Your app should use an Azure SDK that supports `DefaultAzureCredential` or `ManagedIdentityCredential`.
 
+> **Note on YAML vs CLI flags:** When using `--yaml`, any additional CLI flags (like `--user-assigned`) are ignored. Assign the identity separately after creation, or include it in the YAML under `properties.identity`.
+
 ## Verify Connectivity
 
-1. Exec into the container to test blob access:
+### Option A: Using `az containerapp exec` (requires ingress)
+
+> **Important:** `az containerapp exec` requires ingress to be enabled on the container app. Without ingress, you'll get `ClusterExecFailure` errors. Enable ingress first (see the "Enable internal ingress" step above), then exec will work.
 
 ```bash
 az containerapp exec \
@@ -298,17 +342,14 @@ az containerapp exec \
   --command /bin/bash
 ```
 
-2. From inside the container, verify DNS resolution:
+From inside the container, verify DNS resolution and test blob access:
 
 ```bash
+# Verify private DNS resolves to private IP
 nslookup ${STORAGE_ACCOUNT_NAME}.blob.core.windows.net
-```
+# Expected: 10.0.2.x (private endpoint IP), not a public IP
 
-The response should resolve to a `10.0.2.x` IP (the private endpoint), not a public IP.
-
-3. Test blob access using the managed identity:
-
-```bash
+# Login with managed identity
 az login --identity --client-id ${AZURE_CLIENT_ID}
 
 # Upload a test file
@@ -326,13 +367,63 @@ az storage blob list \
   --container-name ${STORAGE_CONTAINER_NAME} \
   --auth-mode login \
   --output table
-```
 
-4. Exit the container:
-
-```bash
 exit
 ```
+
+### Option B: Bake test into startup command (alternative)
+
+If you prefer not to use interactive `exec`, or if you need automated validation in a CI/CD pipeline, embed the test script in the container's startup command and read the results from logs:
+
+```bash
+cat <<EOF > container-app-test.yaml
+properties:
+  template:
+    containers:
+      - name: ${ACA_APP_NAME}
+        image: mcr.microsoft.com/azure-cli:latest
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+        env:
+          - name: AZURE_CLIENT_ID
+            value: "${IDENTITY_CLIENT_ID}"
+          - name: STORAGE_ACCOUNT_NAME
+            value: "${STORAGE_ACCOUNT}"
+          - name: STORAGE_CONTAINER_NAME
+            value: "${STORAGE_CONTAINER}"
+        command:
+          - /bin/bash
+          - -c
+          - |
+            az login --identity --client-id \$AZURE_CLIENT_ID
+            az storage container create --account-name \$STORAGE_ACCOUNT_NAME --name \$STORAGE_CONTAINER_NAME --auth-mode login
+            echo "HELLO_FROM_ACA" > /tmp/test.txt
+            az storage blob upload --account-name \$STORAGE_ACCOUNT_NAME --container-name \$STORAGE_CONTAINER_NAME --name test.txt --file /tmp/test.txt --auth-mode login --overwrite
+            echo "=== TEST RESULT: SUCCESS ==="
+            sleep infinity
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
+EOF
+
+az containerapp update \
+  --name ${ACA_APP_NAME} \
+  --resource-group ${RESOURCE_GROUP} \
+  --yaml container-app-test.yaml
+```
+
+Then check the console logs:
+
+```bash
+az containerapp logs show \
+  --resource-group ${RESOURCE_GROUP} \
+  --name ${ACA_APP_NAME} \
+  --type console \
+  --follow false
+```
+
+You should see `=== TEST RESULT: SUCCESS ===` in the output, confirming the entire chain works: managed identity → private DNS → private endpoint → blob storage.
 
 ## Using the Azure SDK (Application Code)
 
