@@ -1,6 +1,6 @@
 # Azure Container Apps with Private Blob Storage Access Using Workload Identity
 
-This guide walks through deploying an Azure Container Apps (ACA) environment that securely accesses Azure Blob Storage over a private endpoint, authenticated via Workload Identity — no keys, no public network exposure.
+This guide walks through deploying an Azure Container Apps (ACA) environment that securely accesses Azure Blob Storage over a private endpoint, authenticated via Workload Identity — no shared keys, no secrets in code.
 
 ## Architecture Overview
 
@@ -11,23 +11,24 @@ This guide walks through deploying an Azure Container Apps (ACA) environment tha
 │  ┌────────────────────────┐         ┌──────────────────────────────┐  │
 │  │  Container App         │         │  Private Endpoint (blob)     │  │
 │  │  (Workload Identity)   │────────▶│  privatelink.blob.core...    │  │
-│  │                        │  HTTPS  │  10.0.x.x                    │  │
+│  │  + Ingress (ext/int)   │  HTTPS  │  10.0.2.x                   │  │
 │  └────────────────────────┘         └──────────┬───────────────────┘  │
-│                                                 │                      │
-└─────────────────────────────────────────────────┼──────────────────────┘
-                                                  │
-                                                  ▼
-                               ┌────────────────────────────────┐
-                               │  Azure Blob Storage            │
-                               │  publicNetworkAccess: Disabled │
-                               │  Workload Identity auth (RBAC) │
-                               └────────────────────────────────┘
+│            │                                    │                      │
+└────────────┼────────────────────────────────────┼──────────────────────┘
+             │                                    │
+             ▼                                    ▼
+    ┌─────────────────┐         ┌────────────────────────────────┐
+    │  External Users  │         │  Azure Blob Storage            │
+    │  (if ext ingress)│         │  publicNetworkAccess: Disabled │
+    └─────────────────┘         │  Workload Identity auth (RBAC) │
+                                └────────────────────────────────┘
 ```
 
 **Key principles:**
 - No shared keys or connection strings — authentication via federated Workload Identity
 - No public network access to storage — traffic flows over a private endpoint within the VNet
 - Private DNS zone resolves the storage FQDN to the private IP inside the VNet
+- ACA environment supports both internal-only and external ingress modes (the storage remains private regardless)
 
 ## Prerequisites
 
@@ -260,11 +261,12 @@ az containerapp env create \
   --name ${ACA_ENV_NAME} \
   --resource-group ${RESOURCE_GROUP} \
   --location ${LOCATION} \
-  --infrastructure-subnet-resource-id ${ACA_SUBNET_ID} \
-  --internal-only true
+  --infrastructure-subnet-resource-id ${ACA_SUBNET_ID}
 ```
 
-> **Note:** `--internal-only true` means the environment has no public endpoint. Apps are only accessible from within the VNet. Remove this flag if you need external ingress.
+> **Note:** By default, the environment allows external ingress. Add `--internal-only true` if apps should only be accessible from within the VNet. Note that `--internal-only` cannot be changed after creation — you must recreate the environment to switch modes.
+
+> **Important:** `az containerapp exec` requires ingress to be enabled on the container app. Without ingress, you'll get `ClusterExecFailure` errors.
 
 ## Deploy the Container App
 
@@ -314,16 +316,18 @@ az containerapp identity assign \
   --user-assigned ${IDENTITY_RESOURCE_ID}
 ```
 
-Enable internal ingress (required for `az containerapp exec` and for service-to-service communication within the VNet):
+Enable ingress (required for `az containerapp exec` and for service-to-service communication):
 
 ```bash
 az containerapp ingress enable \
   --resource-group ${RESOURCE_GROUP} \
   --name ${ACA_APP_NAME} \
-  --type internal \
+  --type external \
   --target-port 8080 \
   --transport auto
 ```
+
+> **Note:** Use `--type internal` if the app should only be reachable from within the VNet.
 
 > **Tip:** Replace the image and command with your actual application. The example above uses the Azure CLI image for testing. Your app should use an Azure SDK that supports `DefaultAzureCredential` or `ManagedIdentityCredential`.
 
@@ -477,8 +481,8 @@ The `DefaultAzureCredential` automatically picks up the `AZURE_CLIENT_ID` enviro
 
 | Concern | Recommendation |
 | - | - |
-| Network isolation | Use `--internal-only true` for environments that don't need public ingress |
-| DNS resolution | Ensure the private DNS zone is linked to the ACA VNet; verify with `nslookup` from inside a container |
+| Network isolation | Add `--internal-only true` at environment creation if apps should not be publicly reachable (cannot be changed later) |
+| DNS resolution | Ensure the private DNS zone is linked to the ACA VNet; verify with `python3 socket.getaddrinfo()` from inside the container (`nslookup`/`dig` are not available in the azure-cli image) |
 | Identity scope | Use a dedicated managed identity per app with least-privilege RBAC (e.g., `Storage Blob Data Reader` if write isn't needed) |
 | Storage redundancy | Use `Standard_ZRS` or `Standard_GRS` for production workloads |
 | Scaling | Configure `--min-replicas` and `--max-replicas` based on workload; each replica shares the same identity |
@@ -494,7 +498,7 @@ az group delete --name ${RESOURCE_GROUP} --yes --no-wait
 
 ## Conclusion
 
-Azure Container Apps with VNet integration, private endpoints, and Workload Identity provides a zero-trust path to Azure Blob Storage. No shared keys rotate, no public endpoints to protect, and no secrets to manage in your application code. The Azure SDK's `DefaultAzureCredential` handles token acquisition transparently, making the developer experience identical to running locally with `az login`.
+Azure Container Apps with VNet integration, private endpoints, and Workload Identity provides a secure path to Azure Blob Storage. No shared keys rotate, no secrets to manage in your application code. Storage traffic stays on the private network via the private endpoint (public access to storage remains disabled), while the ACA app itself can be exposed externally or kept internal depending on your needs. The Azure SDK's `DefaultAzureCredential` handles token acquisition transparently, making the developer experience identical to running locally with `az login`.
 
 ## References
 
