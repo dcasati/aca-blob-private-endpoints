@@ -490,7 +490,43 @@ The `DefaultAzureCredential` automatically picks up the `AZURE_CLIENT_ID` enviro
 | Policy compliance | If Azure Policy enforces `publicNetworkAccess: Disabled`, the private endpoint is mandatory — plan for it from day one |
 | Container image | Store images in Azure Container Registry (ACR) with a private endpoint if your environment requires it |
 
+## Quick Start with run.sh
+
+The included `run.sh` script automates the entire deployment. It's idempotent — safe to run multiple times.
+
+```bash
+# Show help and current configuration
+./run.sh
+
+# Check dependencies (az, jq, containerapp extension)
+./run.sh -x check-deps
+
+# Deploy the full solution
+./run.sh -x install
+
+# Show deployment status
+./run.sh -x show
+
+# Run connectivity test (blob upload from inside the container)
+./run.sh -x test
+
+# Delete all resources
+./run.sh -x delete
+```
+
+Override any default with environment variables:
+
+```bash
+LOCATION=eastus2 STORAGE_ACCOUNT=mystaccount RESOURCE_GROUP=rg-my-demo ./run.sh -x install
+```
+
 ## Cleanup
+
+```bash
+./run.sh -x delete
+```
+
+Or manually:
 
 ```bash
 az group delete --name ${RESOURCE_GROUP} --yes --no-wait

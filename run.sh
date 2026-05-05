@@ -228,22 +228,24 @@ create_private_endpoint() {
     log "  VNet link created"
   fi
 
-  # DNS zone group
-  if az network private-endpoint dns-zone-group show --resource-group "$RESOURCE_GROUP" --endpoint-name "$pe_name" --name "blob-dns-group" >/dev/null 2>&1; then
-    log "  DNS zone group already exists"
-  else
-    local dns_zone_id
-    dns_zone_id=$(az network private-dns zone show --resource-group "$RESOURCE_GROUP" --name "privatelink.blob.core.windows.net" --query "id" -o tsv)
+  # DNS zone group (always recreate to ensure correct zone linkage)
+  local dns_zone_id
+  dns_zone_id=$(az network private-dns zone show --resource-group "$RESOURCE_GROUP" --name "privatelink.blob.core.windows.net" --query "id" -o tsv)
 
-    az network private-endpoint dns-zone-group create \
-      --resource-group "$RESOURCE_GROUP" \
-      --endpoint-name "$pe_name" \
-      --name "blob-dns-group" \
-      --private-dns-zone "$dns_zone_id" \
-      --zone-name "privatelink-blob" \
-      -o none
-    log "  DNS zone group created"
-  fi
+  az network private-endpoint dns-zone-group delete \
+    --resource-group "$RESOURCE_GROUP" \
+    --endpoint-name "$pe_name" \
+    --name "blob-dns-group" \
+    --yes 2>/dev/null || true
+
+  az network private-endpoint dns-zone-group create \
+    --resource-group "$RESOURCE_GROUP" \
+    --endpoint-name "$pe_name" \
+    --name "blob-dns-group" \
+    --private-dns-zone "$dns_zone_id" \
+    --zone-name "privatelink-blob" \
+    -o none
+  log "  DNS zone group configured"
 }
 
 create_identity() {
@@ -319,41 +321,16 @@ deploy_container_app() {
   if az containerapp show --resource-group "$RESOURCE_GROUP" --name "$ACA_APP_NAME" >/dev/null 2>&1; then
     log "  Container app already exists"
   else
-    # Create YAML template
-    cat <<EOF > /tmp/aca-deploy.yaml
-properties:
-  template:
-    containers:
-      - name: ${ACA_APP_NAME}
-        image: mcr.microsoft.com/azure-cli:latest
-        resources:
-          cpu: 0.5
-          memory: 1Gi
-        env:
-          - name: AZURE_CLIENT_ID
-            value: "${identity_client_id}"
-          - name: STORAGE_ACCOUNT_NAME
-            value: "${STORAGE_ACCOUNT}"
-          - name: STORAGE_CONTAINER_NAME
-            value: "${STORAGE_CONTAINER}"
-        command:
-          - /bin/bash
-          - -c
-          - "echo 'Container ready' && sleep infinity"
-    scale:
-      minReplicas: 1
-      maxReplicas: 1
-EOF
-
     az containerapp create \
       --name "$ACA_APP_NAME" \
       --resource-group "$RESOURCE_GROUP" \
       --environment "$ACA_ENV_NAME" \
-      --yaml /tmp/aca-deploy.yaml \
+      --image mcr.microsoft.com/azure-cli:latest \
+      --cpu 0.5 --memory 1.0Gi \
+      --min-replicas 1 --max-replicas 1 \
+      --env-vars "AZURE_CLIENT_ID=${identity_client_id}" "STORAGE_ACCOUNT_NAME=${STORAGE_ACCOUNT}" "STORAGE_CONTAINER_NAME=${STORAGE_CONTAINER}" \
       -o none
     log "  Container app created"
-
-    rm -f /tmp/aca-deploy.yaml
   fi
 
   # Assign identity
