@@ -346,7 +346,8 @@ From inside the container, verify DNS resolution and test blob access:
 
 ```bash
 # Verify private DNS resolves to private IP
-nslookup ${STORAGE_ACCOUNT_NAME}.blob.core.windows.net
+# (nslookup/dig are not available in the azure-cli image; use Python instead)
+python3 -c "import socket; print(socket.getaddrinfo('${STORAGE_ACCOUNT_NAME}.blob.core.windows.net', 443))"
 # Expected: 10.0.2.x (private endpoint IP), not a public IP
 
 # Login with managed identity
